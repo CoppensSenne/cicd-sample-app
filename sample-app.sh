@@ -1,11 +1,10 @@
 #!/bin/bash
 set -euo pipefail
 
+rm -rf tempdir
 mkdir tempdir
 mkdir tempdir/templates
 mkdir tempdir/static
-rm -rf tempdir
-mkdir tempdir
 
 cp sample_app.py tempdir/.
 cp -r templates/* tempdir/templates/.
@@ -22,8 +21,8 @@ CMD python /home/myapp/sample_app.py
 _EOF_
 
 cd tempdir || exit
-docker build -t sampleapp .
 docker stop samplerunning || true
 docker rm samplerunning || true
+docker build -t sampleapp .
 docker run -t -d -p 5050:5050 --name samplerunning sampleapp
 docker ps -a 
