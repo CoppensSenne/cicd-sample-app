@@ -292,6 +292,248 @@ docker ps
 
 
 
+# Uitbreiding
 
+## 12. RISE-app op MariaDB
+
+Fork: https://github.com/CoppensSenne/rise-app (van HOGENT-RISE/2526-dotnet-template)
+
+De template gebruikt SQLite. Ik heb dit gewisseld naar MariaDB (`mariadb:11.4`). Het .NET SDK draait in een tijdelijke container, dus er staat niets extra op de VM.
+
+Wijzigingen:
+
+- `Rise.Persistence.csproj`: SQLite-pakket vervangen door `Pomelo.EntityFrameworkCore.MySql`
+- `Rise.Server/Program.cs`: `UseSqlite(...)` vervangen door `UseMySql(..., new MariaDbServerVersion(new Version(11, 4, 0)))`
+- `Rise.Server/appsettings.json`: connection string naar MariaDB
+- `Rise.Client/wwwroot/appsettings.json`: `BackendUrl` en `FrontendUrl` naar `http://172.16.0.10:8082`
+- DbContext (`OnModelCreating`): lengtes van strings aangepast (zie problemen)
+- Migrations: oude SQLite-migrations verwijderd en opnieuw gegenereerd
+
+```bash
+docker run --rm -v "$PWD":/work -w /work mcr.microsoft.com/dotnet/sdk:9.0 bash -c '
+set -e
+cd /work/src/Rise.Persistence
+dotnet remove package Microsoft.EntityFrameworkCore.Sqlite
+dotnet add package Pomelo.EntityFrameworkCore.MySql
+rm -rf Migrations
+dotnet tool install --global dotnet-ef --version 9.0.9
+export PATH="$PATH:/root/.dotnet/tools"
+cd /work/src
+dotnet ef migrations add InitialCreate --startup-project Rise.Server --project Rise.Persistence
+'
+```
+
+Migrations zijn provider-specifiek, daarom moesten ze opnieuw gemaakt worden. De vaste `MariaDbServerVersion` is nodig, anders probeert de app al bij het opstarten te verbinden met een database die nog niet bestaat.
+
+
+Dockerfile in de root:
+
+```dockerfile
+FROM mcr.microsoft.com/dotnet/sdk:9.0 AS build
+WORKDIR /src
+COPY . .
+RUN dotnet publish src/Rise.Server -c Release -o /app
+
+FROM mcr.microsoft.com/dotnet/aspnet:9.0
+WORKDIR /app
+COPY --from=build /app .
+EXPOSE 8080
+ENTRYPOINT ["dotnet", "Rise.Server.dll"]
+```
+
+Het Jenkinsfile heeft dezelfde opbouw als dat van de todo-app, met eigen netwerk `rise-net`, containers `risedb` en `riseapp` en poort **8082**. De connection string wordt in de container overschreven met `ConnectionStrings__DatabaseConnection`. Er is geen `schema.sql`: de app maakt zelf de tabellen en testgebruikers aan via de migrations.
+
+Jenkins: Pipeline `RiseAppPipeline`, *Pipeline script from SCM*, URL van de fork, `*/main`, `Jenkinsfile`.
+![alt text](image-10.png)
+
+Controle:
+
+```bash
+docker exec risedb mariadb -urise_usr -pletmeinplz rise_db -e "SHOW TABLES;"
+docker exec risedb mariadb -urise_usr -pletmeinplz rise_db -e "SELECT Email FROM Users;"
+```
+resultaat
+```bash
+vagrant@infra010:~$ docker exec risedb mariadb -urise_usr -pletmeinplz rise_db -e "SHOW TABLES;"
+docker exec risedb mariadb -urise_usr -pletmeinplz rise_db -e "SELECT Email FROM Users;"
+Tables_in_rise_db
+Product
+Project
+RoleClaims
+Roles
+Technician
+UserClaims
+UserLogins
+UserRoles
+UserTokens
+Users
+__EFMigrationsHistory
+Email
+technician2@example.com
+technician1@example.com
+secretary@example.com
+admin@example.com
+user@example.com
+vagrant@infra010:~$
+```
+![alt text](image-11.png)
+
+### Fout 1: sleutel te lang
+
+```
+MySqlException: Specified key was too long; max key length is 3072 bytes
+```
+
+Oorzaak: sleutelkolommen waren `varchar(4000)`. Met `utf8mb4` is dat 16.000 bytes, en MariaDB staat maximaal 3072 toe. SQLite heeft die limiet niet.
+
+Oplossing: string-sleutels beperkt tot 255 tekens in `OnModelCreating`.
+
+### Fout 2: rij te groot
+
+```
+MySqlException: Row size too large. The maximum row size ... is 65535
+```
+
+Oorzaak: vier `varchar(4000)`-kolommen in `Users` samen zijn te groot voor één rij.
+
+Oplossing: lange strings omgezet naar `longtext`.
+
+Na elke wijziging aan het model: migrations opnieuw maken en het volume wissen (`docker volume rm rise-db-data`), want MariaDB draait een half aangemaakte database niet terug.
+
+### Fout 3: inloggen en registreren mislukten in de browser
+
+```
+An unknown error prevented registration from succeeding.
+```
+
+Oorzaak: de Blazor-client draait in de browser en had `BackendUrl` op `https://localhost:5001`. Dat wijst naar mijn eigen pc, niet naar de VM. De serverlog toonde geen fouten, want de aanvragen kwamen nooit aan.
+
+Onderzoek: de API met `curl` getest vanuit de VM (`200 OK`, gebruiker stond in MariaDB).
+
+Oplossing: `BackendUrl` en `FrontendUrl` aangepast naar `http://172.16.0.10:8082` en Ctrl + F5 (Blazor bewaart dit bestand in de cache).
+
+
+
+---
+
+## 13. Automatisch deployen bij een push
+
+Een webhook kan niet, want 172.16.0.10 is een privéadres dat GitHub niet bereikt. Daarom vraagt Jenkins elke minuut aan GitHub of er iets nieuws is (*Poll SCM*). Bovenaan het Jenkinsfile:
+
+```groovy
+properties([
+    disableConcurrentBuilds(),
+    pipelineTriggers([pollSCM("* * * * *")])
+])
+```
+
+Eén keer handmatig **Build Now** (Jenkins leest de trigger pas tijdens een run), daarna nooit meer.
+
+Demo:
+
+```bash
+echo "Demo continuous deployment" >> README.md
+git add .
+git commit -m "Demo: automatic deployment"
+git push origin main
+```
+
+Binnen een minuut start er vanzelf een run. Bovenaan de Console Output staat `Started by an SCM change`.
+
+![alt text](image-12.png)
+
+### Fout: twee builds tegelijk
+
+```
+docker: Error response from daemon: Conflict. The container name "/riseapp" is already in use
+```
+
+Oorzaak: twee pushes vlak na elkaar gaven twee parallelle builds (`RiseAppPipeline` en `RiseAppPipeline@2`), die dezelfde containernaam wilden.
+
+Oplossing: `disableConcurrentBuilds()`, zodat builds na elkaar draaien.
+
+Beperking: de app is tijdens een build enkele minuten niet bereikbaar. In een echte omgeving gebruik je meerdere instanties achter een loadbalancer.
+
+---
+
+## 14. Jenkins persistent met Ansible
+
+Doel: na `vagrant destroy` en `vagrant up` staat Jenkins er weer, met dezelfde gebruiker en alle jobs, zonder handwerk.
+
+`control.sh` voert bij `vagrant up` het playbook `site.yml` uit, dat de rol `dockerhost` (Docker en Portainer) bevat. Ik heb een rol `jenkins` toegevoegd. Het volume `jenkins-data` verdwijnt bij een destroy, dus de bron van de configuratie is de code in Git.
+
+```
+ansible/roles/jenkins/
+├── defaults/main.yml        wachtwoord, namen
+├── files/Dockerfile         Jenkins-image met plugins, zonder installatiewizard
+├── files/casc/jenkins.yaml  admin-gebruiker (Jenkins Configuration as Code)
+├── files/casc/jobs.groovy   alle jobs en pipelines
+├── handlers/main.yml        Jenkins herstarten bij een wijziging
+└── tasks/main.yml           image bouwen en container starten
+```
+
+`site.yml`:
+
+```yaml
+- name: "Configure infra010"
+  hosts: infra010
+  roles:
+    - dockerhost
+    - jenkins
+```
+
+De taken kopiëren de bestanden naar `infra010`, bouwen het image `jenkins-lab` en starten `jenkins_server` met dezelfde opties als in opgave 1.3 (poort 8080, Docker-socket, `jenkins-data`), plus de JCasC-map.
+
+`TestSampleApp` zoekt de IP-adressen dynamisch op met `docker inspect`. In de opgave staan ze vast, maar na een destroy kunnen ze anders zijn.
+
+Testen zonder destroy:
+
+```bash
+docker rm -f jenkins_server && docker volume rm jenkins-data
+```
+
+```bash
+cd /vagrant/ansible
+ansible-playbook -i inventory.yml site.yml --tags jenkins
+```
+resultaat
+```bash
+PLAY [Configure infra010] ******************************************************
+
+TASK [Gathering Facts] *********************************************************
+ok: [infra010]
+
+TASK [jenkins : Create directories for the Jenkins build context and configuration] ***
+ok: [infra010] => (item=/opt/jenkins/build)
+ok: [infra010] => (item=/opt/jenkins/casc)
+
+TASK [jenkins : Copy the Dockerfile for the Jenkins image] *********************
+ok: [infra010]
+
+TASK [jenkins : Copy the Jenkins Configuration as Code files] ******************
+ok: [infra010] => (item=jenkins.yaml)
+ok: [infra010] => (item=jobs.groovy)
+
+TASK [jenkins : Build the Jenkins image (with plugins)] ************************
+ok: [infra010]
+
+TASK [jenkins : Create a Docker container for Jenkins] *************************
+ok: [infra010]
+
+PLAY RECAP *********************************************************************
+infra010                   : ok=6    changed=0    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0
+
+vagrant@control:/vagrant/ansible$
+```
+![alt text](image-13.png)
+
+Eindtest op de host:
+
+```powershell
+vagrant destroy -f
+vagrant up
+```
+
+![alt text](image-14.png)
 
 
