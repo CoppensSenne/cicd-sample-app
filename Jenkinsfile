@@ -3,7 +3,7 @@ pipeline {
   environment {
     APP    = 'sample-app'
     PORT   = '8081'      // poort op dmz010 (enkel 127.0.0.1) en op infra010 (staging)
-    CPORT  = '80'        // poort waarop de app in de container luistert
+    CPORT  = '5050'      // poort waarop de Flask-app in de container luistert
     IMAGE  = "${APP}:${BUILD_NUMBER}"
     DEPLOY = 'deploy@192.0.2.10'
   }
